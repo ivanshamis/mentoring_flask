@@ -1,15 +1,20 @@
 import os
 from datetime import datetime
 from http import HTTPStatus
-from PIL import Image
+from typing import Optional
+from uuid import UUID
+
+from PIL import Image, UnidentifiedImageError
 
 from flask import request, current_app as app
 from flask.views import MethodView
+from flask_pydantic import validate
 from flask_rest_api import Blueprint
+from pydantic import BaseModel
 
-from api_utils import paginate, get_filters, get_ordering
+from api_utils import paginate, parse_query, generate_response_error, generate_response_message
 from extensions import db
-from http_utils import ResponseError
+
 from jwt_utils import jwt_required
 from models import Doc
 
@@ -24,42 +29,68 @@ ALLOWED_EXTENSIONS = IMG_EXTENSIONS + DOC_EXTENSIONS + VIDEO_EXTENSIONS
 
 def save_thumbnail(main_path, doc_id, extension):
     thumbnail_path = None
+
     if extension in IMG_EXTENSIONS:
         square_fit_size = 100
-        image = Image.open(main_path)
-        image.thumbnail((square_fit_size, square_fit_size))
-        thumbnail_path = os.path.join(app.config["UPLOAD_FOLDER"], str(doc_id) + "_thumb" + extension)
-        image.save(thumbnail_path)
+        try:
+            image = Image.open(main_path)
+        except UnidentifiedImageError:
+            image = None
+
+        if image:
+            image.thumbnail((square_fit_size, square_fit_size))
+            thumbnail_path = os.path.join(app.config["UPLOAD_FOLDER"], str(doc_id) + "_thumb" + extension)
+            image.save(thumbnail_path)
+
     return thumbnail_path
+
+
+class DocsGetArgsSchema(BaseModel):
+    start: Optional[int]
+    limit: Optional[int]
+    extension: Optional[str]
+    user_id: Optional[UUID]
+    order: Optional[str]
 
 
 @docs_bp.route("/docs/")
 class Docs(MethodView):
-    table = Doc
+    model = Doc
     path = "/docs"
     filter_fields = ["extension", "user_id"]
     default_filter = {"deleted": False}
     ordering_fields = ["created_at", "name"]
 
     @jwt_required()
-    def get(self, *args, **kwargs):
-        filters = get_filters(self.filter_fields, self.default_filter)
-        ordering = get_ordering(self.ordering_fields, self.table)
-        results = self.table.query.filter_by(**filters).order_by(*ordering).all()
-        return paginate(results, self.path)
+    @validate()
+    def get(self, query: DocsGetArgsSchema, *args, **kwargs):
+        parsed_query = parse_query(
+            query=query,
+            model=self.model,
+            ordering_fields=self.ordering_fields,
+            default_filter=self.default_filter
+        )
+        pagination = parsed_query["pagination"]
+        results = self.model.query.filter_by(
+            **parsed_query["filtering"]
+        ).order_by(
+            *parsed_query["ordering"]
+        ).limit(pagination["limit"]).offset(pagination["start"]).all()
+
+        return paginate(results, self.path, parsed_query)
 
     @jwt_required()
     def post(self, user_id):
         file = request.files.get('file')
         if not file:
-            raise ResponseError(status=HTTPStatus.BAD_REQUEST, message="Please provide a file")
+            return generate_response_error(status=HTTPStatus.BAD_REQUEST, message="Please provide a file")
         filename, extension = os.path.splitext(file.filename)
         extension = extension.lower()
 
         if extension not in ALLOWED_EXTENSIONS:
-            raise ResponseError(status=HTTPStatus.BAD_REQUEST, message="The file type is not allowed")
+            return generate_response_error(status=HTTPStatus.BAD_REQUEST, message="The file type is not allowed")
 
-        doc = self.table(
+        doc = self.model(
             name=filename,
             extension=extension,
             path="/",  # will setup the path later
@@ -73,7 +104,7 @@ class Docs(MethodView):
         doc.thumbnail = save_thumbnail(doc.path, doc.id, extension)
         db.session.commit()
 
-        return {"result": f"Uploaded: {file.filename} -> {doc.path}"}
+        return generate_response_message(status=HTTPStatus.CREATED, message=f"Uploaded: {file.filename} -> {doc.path}")
 
 
 @docs_bp.route("/docs/<item_id>")
@@ -86,9 +117,9 @@ class DocsById(MethodView):
     def delete(self, item_id, user_id, *args, **kwargs):
         doc = Doc.query.get_or_404(item_id)
         if doc.deleted:
-            raise ResponseError(status=HTTPStatus.NOT_FOUND, message="File not found")
+            return generate_response_error(status=HTTPStatus.NOT_FOUND, message="File not found")
         if str(doc.user_id) != str(user_id):
-            raise ResponseError(status=HTTPStatus.FORBIDDEN, message="User is not owner of the document")
+            return generate_response_error(status=HTTPStatus.FORBIDDEN, message="User is not owner of the document")
         doc.deleted = True
         db.session.commit()
-        return "", HTTPStatus.NO_CONTENT
+        return generate_response_message(status=HTTPStatus.NO_CONTENT)

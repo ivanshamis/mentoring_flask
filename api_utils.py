@@ -1,47 +1,60 @@
-from http import HTTPStatus
-
 from flask import request
+from pydantic import BaseModel
 
-from http_utils import ResponseError
-
-
-def paginate(results, url):
-    start = int(request.args.get('start', 1))
-    limit = int(request.args.get('limit', 10))
-    count = len(results)
-    if count < start or limit < 0:
-        raise ResponseError(status=HTTPStatus.NOT_FOUND, message="Not found")
-    obj = {'start': start, 'limit': limit, 'count': count}
-    if start == 1:
-        obj['previous'] = ''
-    else:
-        start_copy = max(1, start - limit)
-        limit_copy = start - 1
-        obj['previous'] = url + '?start=%d&limit=%d' % (start_copy, limit_copy)
-    if start + limit > count:
-        obj['next'] = ''
-    else:
-        start_copy = start + limit
-        obj['next'] = url + '?start=%d&limit=%d' % (start_copy, limit)
-    obj['results'] = [i.serialize for i in results[(start - 1):(start - 1 + limit)]]
-    return obj
+from extensions import db
 
 
-def get_filters(filter_fields: list, default_filter: dict):
-    filters = default_filter.copy()
-    for field in filter_fields:
-        value = request.args.get(field)
-        if value:
-            filters.update({field: value})
-    return filters
+def paginate(results: list, url: str, parsed_query: dict) -> dict:
+    start = parsed_query["pagination"]["start"]
+    limit = parsed_query["pagination"]["limit"]
+    previous_url = f"?start={max(1, start - limit)}&limit={limit}" if start > 1 else ""
+    next_url = f"?start={start + limit}&limit={limit}" if len(results) == limit else ""
+    other_params = parsed_query["filtering"].copy()
+    other_params["order"] = parsed_query["order"]
+    others = ''.join([f"&{key}={value}" for key, value in other_params.items() if value])
+    return {
+        "start": start,
+        "limit": limit,
+        "previous": url + previous_url + others if previous_url else "",
+        "next": url + next_url + others if next_url else "",
+        "results": [i.serialize for i in results]
+    }
 
 
-def get_ordering(ordering_fields: list, table):
+def get_ordering(order_request, ordering_fields: list, model):
     ordering = []
-    order_request = request.args.get("order", "").split(",")
-    for field in ordering_fields:
-        if field in order_request:
-            ordering.append(getattr(table, field))
-        elif f"-{field}" in order_request:
-            ordering.append(getattr(table, field).desc())
+    if order_request:
+        for field in ordering_fields:
+            if field in order_request:
+                ordering.append(getattr(model, field))
+            elif f"-{field}" in order_request:
+                ordering.append(getattr(model, field).desc())
     return ordering
+
+
+def parse_query(query: BaseModel, model: db.Model, ordering_fields: list, default_filter: dict) -> dict:
+    query_dict = {key: value for key, value in query.dict().items() if value}
+    order_request = query_dict.pop("order", "")
+    filtering = {key: value for key, value in query_dict.items() if value}
+    filtering.update(default_filter)
+    return {
+        "ordering": get_ordering(
+            order_request=order_request,
+            ordering_fields=ordering_fields,
+            model=model,
+        ),
+        "order": order_request,
+        "pagination": {
+            "start": query_dict.pop("start", 1),
+            "limit": query_dict.pop("limit", 10),
+        },
+        "filtering": filtering
+    }
+
+
+def generate_response_message(status: int, message: str = "", key: str = "result"):
+    return {key: message} if message else "", status
+
+
+def generate_response_error(status: int, message: str):
+    return generate_response_message(status=status, message=message, key="error")
